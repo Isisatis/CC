@@ -1,13 +1,36 @@
-"""Polymarket API client wrapper using py-clob-client"""
+"""Polymarket API client wrapper using py-clob-client."""
 
 import os
 import time
+import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import requests
+from requests.exceptions import RequestException, Timeout, HTTPError
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+class APIError(Exception):
+    """Base exception for API errors."""
+
+    def __init__(self, message: str, status_code: int = None, response: dict = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response = response
+
+
+class RateLimitError(APIError):
+    """Raised when rate limit is exceeded."""
+    pass
+
+
+class AuthenticationError(APIError):
+    """Raised when authentication fails."""
+    pass
 
 
 class PolymarketClient:
@@ -28,7 +51,9 @@ class PolymarketClient:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
-        rate_limit: float = 0.1,  # seconds between requests
+        rate_limit: float = 0.1,
+        timeout: int = 30,
+        max_retries: int = 3,
     ):
         """
         Initialize Polymarket client.
@@ -40,6 +65,8 @@ class PolymarketClient:
             api_secret: API secret for signing
             api_passphrase: API passphrase
             rate_limit: Minimum seconds between requests
+            timeout: Request timeout in seconds
+            max_retries: Maximum retry attempts for transient errors
         """
         self.clob_url = clob_url or self.CLOB_BASE_URL
         self.gamma_url = gamma_url or self.GAMMA_BASE_URL
@@ -47,6 +74,8 @@ class PolymarketClient:
         self.api_secret = api_secret or os.getenv("POLYMARKET_API_SECRET")
         self.api_passphrase = api_passphrase or os.getenv("POLYMARKET_API_PASSPHRASE")
         self.rate_limit = rate_limit
+        self.timeout = timeout
+        self.max_retries = max_retries
         self._last_request_time = 0
 
         self.session = requests.Session()
@@ -55,7 +84,11 @@ class PolymarketClient:
             "Content-Type": "application/json",
         })
 
-        # Try to initialize py-clob-client for advanced operations
+        logger.info(
+            f"PolymarketClient initialized | clob_url={self.clob_url} | "
+            f"gamma_url={self.gamma_url} | rate_limit={rate_limit}s"
+        )
+
         self._clob_client = None
         self._init_clob_client()
 
@@ -65,13 +98,11 @@ class PolymarketClient:
             from py_clob_client.client import ClobClient
             from py_clob_client.clob_types import ApiCreds
 
-            # For read-only operations, we don't need credentials
             self._clob_client = ClobClient(
                 host=self.clob_url,
-                chain_id=137,  # Polygon mainnet
+                chain_id=137,
             )
 
-            # If we have API credentials, set them up for trading
             if self.api_key and self.api_secret and self.api_passphrase:
                 creds = ApiCreds(
                     api_key=self.api_key,
@@ -79,18 +110,27 @@ class PolymarketClient:
                     api_passphrase=self.api_passphrase,
                 )
                 self._clob_client.set_api_creds(creds)
+                logger.info("py-clob-client initialized with API credentials")
+            else:
+                logger.info("py-clob-client initialized (read-only, no credentials)")
 
         except ImportError:
+            logger.warning(
+                "py-clob-client not installed. Trading operations unavailable. "
+                "Install with: pip install py-clob-client"
+            )
             self._clob_client = None
-        except Exception:
-            # Fall back to direct HTTP if clob client fails
+        except Exception as e:
+            logger.warning(f"Failed to initialize py-clob-client: {e}")
             self._clob_client = None
 
     def _rate_limit_wait(self):
         """Enforce rate limiting between requests."""
         elapsed = time.time() - self._last_request_time
         if elapsed < self.rate_limit:
-            time.sleep(self.rate_limit - elapsed)
+            sleep_time = self.rate_limit - elapsed
+            logger.debug(f"Rate limiting: sleeping {sleep_time:.3f}s")
+            time.sleep(sleep_time)
         self._last_request_time = time.time()
 
     def _request(
@@ -99,10 +139,10 @@ class PolymarketClient:
         url: str,
         params: Dict = None,
         data: Dict = None,
-        timeout: int = 30,
+        timeout: int = None,
     ) -> Dict[str, Any]:
         """
-        Make an HTTP request with rate limiting.
+        Make an HTTP request with rate limiting and retry logic.
 
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -113,18 +153,80 @@ class PolymarketClient:
 
         Returns:
             Response JSON data
-        """
-        self._rate_limit_wait()
 
-        response = self.session.request(
-            method=method,
-            url=url,
-            params=params,
-            json=data,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        Raises:
+            APIError: For API-level errors
+            RateLimitError: When rate limited
+            RequestException: For network errors
+        """
+        timeout = timeout or self.timeout
+        last_exception = None
+
+        for attempt in range(self.max_retries):
+            self._rate_limit_wait()
+
+            try:
+                logger.debug(
+                    f"HTTP {method} {url} | params={params} | attempt={attempt + 1}"
+                )
+
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=data,
+                    timeout=timeout,
+                )
+
+                logger.debug(
+                    f"Response: status={response.status_code} | "
+                    f"size={len(response.content)} bytes"
+                )
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 5))
+                    logger.warning(
+                        f"Rate limited. Retry after {retry_after}s | attempt={attempt + 1}"
+                    )
+                    time.sleep(retry_after)
+                    continue
+
+                if response.status_code in (401, 403):
+                    logger.error(f"Authentication error: {response.status_code}")
+                    raise AuthenticationError(
+                        f"Authentication failed: {response.status_code}",
+                        status_code=response.status_code,
+                    )
+
+                response.raise_for_status()
+                return response.json()
+
+            except Timeout as e:
+                logger.warning(f"Request timeout | url={url} | attempt={attempt + 1}")
+                last_exception = e
+                time.sleep(2 ** attempt)
+
+            except HTTPError as e:
+                logger.error(
+                    f"HTTP error | url={url} | status={e.response.status_code} | "
+                    f"response={e.response.text[:200]}"
+                )
+                raise APIError(
+                    str(e),
+                    status_code=e.response.status_code,
+                    response={"text": e.response.text},
+                )
+
+            except RequestException as e:
+                logger.warning(
+                    f"Request failed | url={url} | error={type(e).__name__}: {e} | "
+                    f"attempt={attempt + 1}"
+                )
+                last_exception = e
+                time.sleep(2 ** attempt)
+
+        logger.error(f"All {self.max_retries} retries exhausted for {url}")
+        raise last_exception or APIError(f"Request failed after {self.max_retries} attempts")
 
     # ==================== Gamma API Methods ====================
 
@@ -135,18 +237,9 @@ class PolymarketClient:
         limit: int = 100,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch available markets from Gamma API.
+        """Fetch available markets from Gamma API."""
+        logger.info(f"Fetching markets | active={active} | limit={limit} | offset={offset}")
 
-        Args:
-            active: If True, only return active markets
-            closed: If True, include closed markets
-            limit: Maximum number of markets to return
-            offset: Pagination offset
-
-        Returns:
-            List of market dictionaries
-        """
         params = {
             "limit": limit,
             "offset": offset,
@@ -155,47 +248,38 @@ class PolymarketClient:
         }
 
         url = f"{self.gamma_url}/markets"
-        return self._request("GET", url, params=params)
+        result = self._request("GET", url, params=params)
+
+        logger.info(f"Retrieved {len(result) if isinstance(result, list) else 0} markets")
+        return result
 
     def get_all_markets(self, active: bool = True) -> List[Dict[str, Any]]:
-        """
-        Fetch all markets using pagination.
+        """Fetch all markets using pagination."""
+        logger.info(f"Fetching all markets | active={active}")
 
-        Args:
-            active: If True, only return active markets
-
-        Returns:
-            List of all market dictionaries
-        """
         all_markets = []
         offset = 0
         limit = 100
 
         while True:
-            markets = self.get_markets(
-                active=active, limit=limit, offset=offset
-            )
+            markets = self.get_markets(active=active, limit=limit, offset=offset)
             if not markets:
                 break
             all_markets.extend(markets)
             offset += limit
 
-            # Safety limit
+            logger.debug(f"Pagination progress: fetched {len(all_markets)} markets")
+
             if offset > 10000:
+                logger.warning("Safety limit reached (10000 markets)")
                 break
 
+        logger.info(f"Total markets fetched: {len(all_markets)}")
         return all_markets
 
     def get_market_details(self, condition_id: str) -> Dict[str, Any]:
-        """
-        Get detailed information about a specific market from Gamma API.
-
-        Args:
-            condition_id: The market condition ID
-
-        Returns:
-            Market details dictionary
-        """
+        """Get detailed information about a specific market."""
+        logger.debug(f"Fetching market details | condition_id={condition_id[:16]}...")
         url = f"{self.gamma_url}/markets/{condition_id}"
         return self._request("GET", url)
 
@@ -205,17 +289,9 @@ class PolymarketClient:
         limit: int = 100,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch events from Gamma API.
+        """Fetch events from Gamma API."""
+        logger.debug(f"Fetching events | active={active} | limit={limit}")
 
-        Args:
-            active: If True, only return active events
-            limit: Maximum number of events to return
-            offset: Pagination offset
-
-        Returns:
-            List of event dictionaries
-        """
         params = {
             "limit": limit,
             "offset": offset,
@@ -227,97 +303,51 @@ class PolymarketClient:
 
     # ==================== CLOB API Methods ====================
 
-    def get_order_book(
-        self,
-        token_id: str,
-    ) -> Dict[str, Any]:
-        """
-        Get the order book for a specific token from CLOB API.
-
-        Args:
-            token_id: The token identifier (condition_id + outcome)
-
-        Returns:
-            Order book with bids and asks
-        """
+    def get_order_book(self, token_id: str) -> Dict[str, Any]:
+        """Get the order book for a specific token."""
+        logger.debug(f"Fetching order book | token_id={token_id[:16]}...")
         url = f"{self.clob_url}/book"
         params = {"token_id": token_id}
         return self._request("GET", url, params=params)
 
-    def get_order_books(
-        self,
-        token_ids: List[str],
-    ) -> List[Dict[str, Any]]:
-        """
-        Get order books for multiple tokens.
+    def get_order_books(self, token_ids: List[str]) -> List[Dict[str, Any]]:
+        """Get order books for multiple tokens."""
+        logger.info(f"Fetching {len(token_ids)} order books")
 
-        Args:
-            token_ids: List of token identifiers
-
-        Returns:
-            List of order books
-        """
         books = []
-        for token_id in token_ids:
+        for i, token_id in enumerate(token_ids):
             try:
                 book = self.get_order_book(token_id)
                 books.append({"token_id": token_id, **book})
             except Exception as e:
+                logger.warning(f"Failed to fetch order book for {token_id[:16]}: {e}")
                 books.append({"token_id": token_id, "error": str(e)})
+
+            if (i + 1) % 10 == 0:
+                logger.debug(f"Progress: {i + 1}/{len(token_ids)} order books fetched")
+
         return books
 
     def get_price(self, token_id: str) -> Dict[str, Any]:
-        """
-        Get the current price for a token.
-
-        Args:
-            token_id: The token identifier
-
-        Returns:
-            Price information
-        """
+        """Get the current price for a token."""
         url = f"{self.clob_url}/price"
         params = {"token_id": token_id}
         return self._request("GET", url, params=params)
 
     def get_prices(self, token_ids: List[str]) -> List[Dict[str, Any]]:
-        """
-        Get prices for multiple tokens.
-
-        Args:
-            token_ids: List of token identifiers
-
-        Returns:
-            List of price information
-        """
+        """Get prices for multiple tokens."""
         url = f"{self.clob_url}/prices"
         params = {"token_ids": ",".join(token_ids)}
         return self._request("GET", url, params=params)
 
     def get_midpoint(self, token_id: str) -> Dict[str, Any]:
-        """
-        Get the midpoint price for a token.
-
-        Args:
-            token_id: The token identifier
-
-        Returns:
-            Midpoint price information
-        """
+        """Get the midpoint price for a token."""
         url = f"{self.clob_url}/midpoint"
         params = {"token_id": token_id}
         return self._request("GET", url, params=params)
 
     def get_spread(self, token_id: str) -> Dict[str, Any]:
-        """
-        Get the bid-ask spread for a token.
-
-        Args:
-            token_id: The token identifier
-
-        Returns:
-            Spread information
-        """
+        """Get the bid-ask spread for a token."""
         url = f"{self.clob_url}/spread"
         params = {"token_id": token_id}
         return self._request("GET", url, params=params)
@@ -328,17 +358,9 @@ class PolymarketClient:
         maker: str = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """
-        Get recent trades from CLOB API.
+        """Get recent trades from CLOB API."""
+        logger.debug(f"Fetching trades | token_id={token_id} | limit={limit}")
 
-        Args:
-            token_id: Optional token filter
-            maker: Optional maker address filter
-            limit: Maximum number of trades to return
-
-        Returns:
-            List of trade dictionaries
-        """
         url = f"{self.clob_url}/trades"
         params = {"limit": limit}
 
@@ -350,15 +372,7 @@ class PolymarketClient:
         return self._request("GET", url, params=params)
 
     def get_last_trade_price(self, token_id: str) -> Dict[str, Any]:
-        """
-        Get the last trade price for a token.
-
-        Args:
-            token_id: The token identifier
-
-        Returns:
-            Last trade price information
-        """
+        """Get the last trade price for a token."""
         url = f"{self.clob_url}/last-trade-price"
         params = {"token_id": token_id}
         return self._request("GET", url, params=params)
@@ -373,33 +387,24 @@ class PolymarketClient:
         size: float,
         order_type: str = "GTC",
     ) -> Dict[str, Any]:
-        """
-        Place an order on Polymarket.
+        """Place an order on Polymarket. Requires API credentials."""
+        logger.info(
+            f"Placing order | token_id={token_id[:16]}... | "
+            f"side={side} | price={price} | size={size}"
+        )
 
-        NOTE: Requires API credentials to be configured.
-
-        Args:
-            token_id: The token identifier
-            side: 'BUY' or 'SELL'
-            price: Order price (0-1 for binary markets)
-            size: Order size in shares
-            order_type: Order type ('GTC', 'FOK', 'GTD')
-
-        Returns:
-            Order confirmation details
-        """
         if not self._clob_client:
             raise RuntimeError(
                 "py-clob-client not available. Install with: pip install py-clob-client"
             )
 
         if not self.api_key:
-            raise RuntimeError(
+            raise AuthenticationError(
                 "API credentials required for trading. Set POLYMARKET_API_KEY, "
-                "POLYMARKET_API_SECRET, and POLYMARKET_API_PASSPHRASE environment variables."
+                "POLYMARKET_API_SECRET, and POLYMARKET_API_PASSPHRASE."
             )
 
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import BUY, SELL
 
         side_enum = BUY if side.upper() == "BUY" else SELL
@@ -411,51 +416,43 @@ class PolymarketClient:
             side=side_enum,
         )
 
-        return self._clob_client.create_and_post_order(order_args)
+        result = self._clob_client.create_and_post_order(order_args)
+        logger.info(f"Order placed successfully | result={result}")
+        return result
 
     def cancel_order(self, order_id: str) -> bool:
-        """
-        Cancel an existing order.
+        """Cancel an existing order. Requires API credentials."""
+        logger.info(f"Cancelling order | order_id={order_id}")
 
-        NOTE: Requires API credentials to be configured.
-
-        Args:
-            order_id: The order identifier
-
-        Returns:
-            True if cancellation successful
-        """
         if not self._clob_client:
             raise RuntimeError("py-clob-client not available")
 
         if not self.api_key:
-            raise RuntimeError("API credentials required for trading")
+            raise AuthenticationError("API credentials required for trading")
 
         result = self._clob_client.cancel(order_id)
-        return result.get("success", False)
+        success = result.get("success", False)
+
+        if success:
+            logger.info(f"Order cancelled successfully | order_id={order_id}")
+        else:
+            logger.warning(f"Order cancellation failed | order_id={order_id}")
+
+        return success
 
     def get_my_orders(
         self,
         market: str = None,
         asset_id: str = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Get user's open orders.
+        """Get user's open orders. Requires API credentials."""
+        logger.debug(f"Fetching user orders | market={market} | asset_id={asset_id}")
 
-        NOTE: Requires API credentials to be configured.
-
-        Args:
-            market: Optional market filter (condition_id)
-            asset_id: Optional asset filter (token_id)
-
-        Returns:
-            List of open orders
-        """
         if not self._clob_client:
             raise RuntimeError("py-clob-client not available")
 
         if not self.api_key:
-            raise RuntimeError("API credentials required")
+            raise AuthenticationError("API credentials required")
 
         params = {}
         if market:
@@ -473,33 +470,28 @@ class PolymarketClient:
         return self._request("GET", url)
 
     def health_check(self) -> bool:
-        """
-        Check if the APIs are accessible.
+        """Check if the APIs are accessible."""
+        logger.info("Performing health check...")
 
-        Returns:
-            True if both APIs are accessible
-        """
         try:
             self.get_server_time()
+            logger.debug("CLOB API: OK")
+
             self.get_markets(limit=1)
+            logger.debug("Gamma API: OK")
+
+            logger.info("Health check passed")
             return True
-        except Exception:
+
+        except Exception as e:
+            logger.error(f"Health check failed: {type(e).__name__}: {e}")
             return False
 
     def get_market_summary(self, condition_id: str) -> Dict[str, Any]:
-        """
-        Get a comprehensive summary of a market including metadata and order books.
+        """Get a comprehensive summary of a market including order books."""
+        logger.info(f"Fetching market summary | condition_id={condition_id[:16]}...")
 
-        Args:
-            condition_id: The market condition ID
-
-        Returns:
-            Dictionary with market details and order book data
-        """
-        # Get market metadata from Gamma
         market = self.get_market_details(condition_id)
-
-        # Get order books for each outcome token
         tokens = market.get("tokens", [])
         order_books = []
 
@@ -516,6 +508,7 @@ class PolymarketClient:
                         "spread": spread,
                     })
                 except Exception as e:
+                    logger.warning(f"Failed to fetch data for token {token_id[:16]}: {e}")
                     order_books.append({
                         "token_id": token_id,
                         "outcome": token.get("outcome"),

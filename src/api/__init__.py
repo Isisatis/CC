@@ -67,6 +67,7 @@ from .models import (
 
 from .orderflow import (
     OrderBookTracker,
+    OrderFlowAnalyzer,
     WhaleDetector,
     SignalDetector,
 )
@@ -122,6 +123,7 @@ __all__ = [
     "OrderFlowEvent",
     "OrderFlowSummary",
     "OrderBookTracker",
+    "OrderFlowAnalyzer",
     "WhaleDetector",
     "SignalDetector",
 

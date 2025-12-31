@@ -2,6 +2,27 @@
 Polymarket WebSocket Client & Order Flow Tracker
 
 Real-time order book updates and order flow detection.
+
+HOW ORDER FLOW INFERENCE WORKS:
+===============================
+Polymarket's WebSocket sends order book STATE updates, not individual order events.
+We infer order flow by comparing consecutive book states:
+
+1. PLACEMENTS: Detected when...
+   - New price level appears → new order at that price
+   - Existing level size INCREASES → order(s) added
+
+2. CANCELLATIONS: Detected when...
+   - Price level disappears AND no matching trade → cancelled
+   - Level size DECREASES AND no matching trade → partial cancel
+
+3. FILLS: Detected when...
+   - Level size decreases AND there's a trade at that price → filled
+   - Cross-reference book changes with trade feed to distinguish
+
+The limitation: We see aggregate size per price level, not individual orders.
+So $10k at 0.50 becoming $15k means $5k added, but we don't know by whom
+unless we correlate with trade data that includes maker addresses.
 """
 
 import asyncio
@@ -9,8 +30,8 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Callable, Set
-from collections import defaultdict
+from typing import Optional, Dict, Any, List, Callable, Set, Tuple
+from collections import defaultdict, deque
 import threading
 
 try:
@@ -159,6 +180,248 @@ class OrderBookTracker:
             return None
 
         return self.compute_delta(old, new)
+
+
+# ============================================================================
+# Order Flow Analyzer (Infers placements/cancellations)
+# ============================================================================
+
+class OrderFlowAnalyzer:
+    """
+    Analyzes order book changes to infer order flow events.
+
+    This class takes book state changes and trade data to determine:
+    - New order placements (where, how much)
+    - Order cancellations (where, how much)
+    - Fills vs cancellations (by cross-referencing trades)
+
+    Usage:
+        analyzer = OrderFlowAnalyzer()
+
+        # When you get a book update:
+        events = analyzer.process_book_update(token_id, new_book_state)
+
+        # When you get a trade:
+        analyzer.record_trade(token_id, price, size, side, timestamp)
+    """
+
+    def __init__(self, trade_window_ms: int = 1000):
+        """
+        Args:
+            trade_window_ms: Time window to correlate trades with book changes
+        """
+        self.trade_window_ms = trade_window_ms
+
+        # Current book state per token: {token_id: {price: size}}
+        self._bid_books: Dict[str, Dict[float, float]] = defaultdict(dict)
+        self._ask_books: Dict[str, Dict[float, float]] = defaultdict(dict)
+
+        # Recent trades for correlation: {token_id: deque of (timestamp, price, size, side)}
+        self._recent_trades: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+
+        # Callbacks
+        self.on_placement: Optional[Callable[[OrderFlowEvent], None]] = None
+        self.on_cancellation: Optional[Callable[[OrderFlowEvent], None]] = None
+        self.on_fill: Optional[Callable[[OrderFlowEvent], None]] = None
+
+        # Stats
+        self._stats = defaultdict(lambda: {
+            "placements": 0, "cancellations": 0, "fills": 0,
+            "placement_volume": 0.0, "cancel_volume": 0.0, "fill_volume": 0.0
+        })
+
+    def record_trade(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str,
+        timestamp: Optional[datetime] = None
+    ):
+        """Record a trade for correlation with book changes"""
+        ts = timestamp or datetime.utcnow()
+        self._recent_trades[token_id].append((ts, price, size, side))
+
+    def _find_matching_trade(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str,
+        timestamp: datetime
+    ) -> Optional[Tuple[datetime, float, float, str]]:
+        """Find a recent trade that could explain a book size decrease"""
+        window_start = timestamp - timedelta(milliseconds=self.trade_window_ms)
+
+        for trade in self._recent_trades[token_id]:
+            trade_ts, trade_price, trade_size, trade_side = trade
+            if trade_ts < window_start:
+                continue
+
+            # Match: same price, opposite side (maker side), similar size
+            if abs(trade_price - price) < 0.0001:
+                # For a bid decrease, we look for a sell trade (taker sold into bid)
+                # For an ask decrease, we look for a buy trade (taker bought the ask)
+                expected_side = "SELL" if side == "bid" else "BUY"
+                if trade_side.upper() == expected_side:
+                    if abs(trade_size - size) < size * 0.1:  # Within 10%
+                        return trade
+
+        return None
+
+    def process_book_update(
+        self,
+        token_id: str,
+        bids: List[Tuple[float, float]],  # [(price, size), ...]
+        asks: List[Tuple[float, float]],
+        timestamp: Optional[datetime] = None
+    ) -> List[OrderFlowEvent]:
+        """
+        Process a new book state and emit order flow events.
+
+        Args:
+            token_id: Token being updated
+            bids: List of (price, size) tuples for bid side
+            asks: List of (price, size) tuples for ask side
+            timestamp: When this update was received
+
+        Returns:
+            List of inferred OrderFlowEvent objects
+        """
+        ts = timestamp or datetime.utcnow()
+        events = []
+
+        # Convert to dicts
+        new_bids = {price: size for price, size in bids}
+        new_asks = {price: size for price, size in asks}
+
+        old_bids = self._bid_books[token_id]
+        old_asks = self._ask_books[token_id]
+
+        # Analyze bid side changes
+        events.extend(self._analyze_side_changes(
+            token_id, "bid", old_bids, new_bids, ts
+        ))
+
+        # Analyze ask side changes
+        events.extend(self._analyze_side_changes(
+            token_id, "ask", old_asks, new_asks, ts
+        ))
+
+        # Update stored state
+        self._bid_books[token_id] = new_bids
+        self._ask_books[token_id] = new_asks
+
+        return events
+
+    def _analyze_side_changes(
+        self,
+        token_id: str,
+        side: str,
+        old_book: Dict[float, float],
+        new_book: Dict[float, float],
+        timestamp: datetime
+    ) -> List[OrderFlowEvent]:
+        """Analyze changes on one side of the book"""
+        events = []
+
+        all_prices = set(old_book.keys()) | set(new_book.keys())
+
+        for price in all_prices:
+            old_size = old_book.get(price, 0)
+            new_size = new_book.get(price, 0)
+            size_change = new_size - old_size
+
+            if abs(size_change) < 0.01:  # Ignore tiny changes
+                continue
+
+            if size_change > 0:
+                # SIZE INCREASED = NEW ORDER PLACEMENT
+                event = OrderFlowEvent(
+                    event_type="new_order",
+                    token_id=token_id,
+                    timestamp=timestamp,
+                    side=side,
+                    price=price,
+                    size=size_change,
+                )
+                events.append(event)
+                self._stats[token_id]["placements"] += 1
+                self._stats[token_id]["placement_volume"] += event.notional
+
+                if self.on_placement:
+                    self.on_placement(event)
+
+            else:
+                # SIZE DECREASED = CANCEL or FILL
+                decrease = abs(size_change)
+
+                # Check if there's a matching trade
+                matching_trade = self._find_matching_trade(
+                    token_id, price, decrease, side, timestamp
+                )
+
+                if matching_trade:
+                    # FILL - trade explains the decrease
+                    event = OrderFlowEvent(
+                        event_type="fill",
+                        token_id=token_id,
+                        timestamp=timestamp,
+                        side=side,
+                        price=price,
+                        size=decrease,
+                    )
+                    self._stats[token_id]["fills"] += 1
+                    self._stats[token_id]["fill_volume"] += event.notional
+
+                    if self.on_fill:
+                        self.on_fill(event)
+                else:
+                    # CANCELLATION - no trade, order was pulled
+                    event = OrderFlowEvent(
+                        event_type="cancel",
+                        token_id=token_id,
+                        timestamp=timestamp,
+                        side=side,
+                        price=price,
+                        size=decrease,
+                    )
+                    self._stats[token_id]["cancellations"] += 1
+                    self._stats[token_id]["cancel_volume"] += event.notional
+
+                    if self.on_cancellation:
+                        self.on_cancellation(event)
+
+                events.append(event)
+
+        return events
+
+    def get_stats(self, token_id: str) -> Dict[str, Any]:
+        """Get order flow statistics for a token"""
+        return dict(self._stats[token_id])
+
+    def get_current_book(self, token_id: str) -> Dict[str, Dict[float, float]]:
+        """Get current order book state"""
+        return {
+            "bids": dict(self._bid_books[token_id]),
+            "asks": dict(self._ask_books[token_id]),
+        }
+
+    def reset(self, token_id: Optional[str] = None):
+        """Reset state for a token or all tokens"""
+        if token_id:
+            self._bid_books[token_id] = {}
+            self._ask_books[token_id] = {}
+            self._recent_trades[token_id].clear()
+            self._stats[token_id] = {
+                "placements": 0, "cancellations": 0, "fills": 0,
+                "placement_volume": 0.0, "cancel_volume": 0.0, "fill_volume": 0.0
+            }
+        else:
+            self._bid_books.clear()
+            self._ask_books.clear()
+            self._recent_trades.clear()
+            self._stats.clear()
 
 
 # ============================================================================

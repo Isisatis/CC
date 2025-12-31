@@ -6,6 +6,8 @@ Complete API access to Polymarket's CLOB and Gamma APIs including:
 - Order book data and trading operations
 - Liquidity metrics and analysis
 - Trade history and market events
+- Whale detection and order flow tracking
+- Raw order book data for illiquid market analysis
 """
 
 from .client import (
@@ -39,11 +41,42 @@ from .models import (
     TradeHistory,
     Order,
 
-    # Filtering & Metrics
+    # Filtering & Metrics (abstracted)
     MarketFilter,
     LiquidityMetrics,
     PaginatedResponse,
+
+    # Raw order book data (no abstraction)
+    RawOrderBookLevel,
+    OrderBookSnapshot,
+    OrderBookDelta,
+
+    # Whale & Large Order Detection
+    LargeOrder,
+    WhaleTrade,
+    WalletActivity,
+    MarketWhaleActivity,
+
+    # Order Flow
+    OrderFlowEvent,
+    OrderFlowSummary,
+
+    # Signals
+    IlliquidMarketSignal,
 )
+
+from .orderflow import (
+    OrderBookTracker,
+    WhaleDetector,
+    SignalDetector,
+)
+
+# Conditional WebSocket import
+try:
+    from .orderflow import PolymarketWebSocket
+    HAS_WEBSOCKET = True
+except ImportError:
+    HAS_WEBSOCKET = False
 
 __all__ = [
     # Clients
@@ -59,7 +92,7 @@ __all__ = [
     "OrderType",
     "OutcomeType",
 
-    # Models
+    # Core Models
     "Token",
     "CLOBToken",
     "GammaMarket",
@@ -73,4 +106,28 @@ __all__ = [
     "MarketFilter",
     "LiquidityMetrics",
     "PaginatedResponse",
+
+    # Raw Order Book (for illiquid market analysis)
+    "RawOrderBookLevel",
+    "OrderBookSnapshot",
+    "OrderBookDelta",
+
+    # Whale Detection
+    "LargeOrder",
+    "WhaleTrade",
+    "WalletActivity",
+    "MarketWhaleActivity",
+
+    # Order Flow
+    "OrderFlowEvent",
+    "OrderFlowSummary",
+    "OrderBookTracker",
+    "WhaleDetector",
+    "SignalDetector",
+
+    # Signals
+    "IlliquidMarketSignal",
 ]
+
+if HAS_WEBSOCKET:
+    __all__.append("PolymarketWebSocket")

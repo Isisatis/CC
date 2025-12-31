@@ -1011,3 +1011,320 @@ class PolymarketClient:
         except:
             pass
         return status
+
+    # -------------------------------------------------------------------------
+    # Raw Order Book & Order Flow
+    # -------------------------------------------------------------------------
+
+    def get_raw_order_book(self, token_id: str) -> "OrderBookSnapshot":
+        """
+        Get raw order book snapshot with full detail.
+        No abstraction - returns actual prices/sizes for analysis.
+        """
+        from .models import OrderBookSnapshot, RawOrderBookLevel
+
+        book = self.clob.get_order_book(token_id)
+
+        snapshot = OrderBookSnapshot(
+            token_id=token_id,
+            bids=[RawOrderBookLevel(price=b.price, size=b.size) for b in book.bids],
+            asks=[RawOrderBookLevel(price=a.price, size=a.size) for a in book.asks],
+        )
+        snapshot.snapshot_hash = snapshot.compute_hash()
+        return snapshot
+
+    def get_book_depth_profile(
+        self,
+        token_id: str,
+        bps_levels: List[int] = [10, 25, 50, 100, 200, 500, 1000]
+    ) -> Dict[str, Any]:
+        """
+        Get depth profile at various distances from mid.
+        Returns raw $ amounts, not scores.
+        """
+        snapshot = self.get_raw_order_book(token_id)
+
+        profile = {
+            "token_id": token_id,
+            "mid_price": snapshot.mid_price,
+            "spread_bps": snapshot.spread_bps,
+            "imbalance": snapshot.imbalance,
+            "total_bid_notional": snapshot.total_bid_notional,
+            "total_ask_notional": snapshot.total_ask_notional,
+            "bid_levels": snapshot.bid_count,
+            "ask_levels": snapshot.ask_count,
+            "depth_by_distance": {},
+        }
+
+        for bps in bps_levels:
+            bid_depth, ask_depth = snapshot.depth_at_distance(bps)
+            profile["depth_by_distance"][bps] = {
+                "bid_notional": bid_depth,
+                "ask_notional": ask_depth,
+                "total": bid_depth + ask_depth,
+            }
+
+        # Cost to move price analysis
+        profile["cost_to_move"] = {}
+        for bps in [50, 100, 200, 500]:
+            profile["cost_to_move"][bps] = {
+                "buy": snapshot.cost_to_move_price(bps, OrderSide.BUY),
+                "sell": snapshot.cost_to_move_price(bps, OrderSide.SELL),
+            }
+
+        return profile
+
+    def simulate_fill(
+        self,
+        token_id: str,
+        size: float,
+        side: str
+    ) -> Dict[str, Any]:
+        """
+        Simulate filling an order and get execution details.
+        Returns slippage, avg price, levels consumed, etc.
+        """
+        snapshot = self.get_raw_order_book(token_id)
+        order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
+        return snapshot.fill_simulation(size, order_side)
+
+    # -------------------------------------------------------------------------
+    # Whale & Large Order Tracking
+    # -------------------------------------------------------------------------
+
+    def get_large_orders(
+        self,
+        token_id: str,
+        min_notional: float = 1000,
+        market_id: Optional[str] = None,
+    ) -> List["LargeOrder"]:
+        """
+        Find large orders on the book.
+        Returns orders >= min_notional with context.
+        """
+        from .models import LargeOrder
+
+        snapshot = self.get_raw_order_book(token_id)
+        large_orders = []
+
+        for side, levels, total in [
+            ("bid", snapshot.bids, snapshot.total_bid_notional),
+            ("ask", snapshot.asks, snapshot.total_ask_notional),
+        ]:
+            for level in levels:
+                notional = level.price * level.size
+                if notional >= min_notional:
+                    pct_of_book = (notional / total * 100) if total > 0 else 0
+                    distance_bps = None
+                    if snapshot.mid_price:
+                        distance_bps = abs(level.price - snapshot.mid_price) / snapshot.mid_price * 10000
+
+                    large_orders.append(LargeOrder(
+                        token_id=token_id,
+                        market_id=market_id,
+                        side=side,
+                        price=level.price,
+                        size=level.size,
+                        notional=notional,
+                        pct_of_book=pct_of_book,
+                        pct_of_level=100.0,
+                        distance_from_mid_bps=distance_bps,
+                        is_whale=notional >= 5000,
+                    ))
+
+        # Sort by notional descending
+        large_orders.sort(key=lambda x: x.notional, reverse=True)
+        return large_orders
+
+    def get_whale_trades(
+        self,
+        token_id: Optional[str] = None,
+        market_id: Optional[str] = None,
+        min_notional: float = 5000,
+        limit: int = 100,
+    ) -> List["WhaleTrade"]:
+        """
+        Get large trades (whale activity).
+        """
+        from .models import WhaleTrade
+        from datetime import datetime
+
+        trades = self.clob.get_trades(token_id=token_id, market=market_id, limit=limit)
+        whale_trades = []
+
+        for t in trades.trades:
+            notional = t.price * t.size
+            if notional >= min_notional:
+                whale_trades.append(WhaleTrade(
+                    trade_id=t.id,
+                    token_id=token_id or t.asset_id or "",
+                    market_id=market_id or t.market,
+                    timestamp=t.datetime or datetime.utcnow(),
+                    side=t.side,
+                    price=t.price,
+                    size=t.size,
+                    notional=notional,
+                    maker_address=t.maker_address,
+                    taker_address=t.owner,
+                ))
+
+        return whale_trades
+
+    def get_trader_activity(
+        self,
+        token_id: str,
+        limit: int = 500,
+    ) -> Dict[str, "WalletActivity"]:
+        """
+        Aggregate trading activity by wallet address.
+        Identifies active traders and whales.
+        """
+        from .models import WalletActivity, WhaleTrade
+        from datetime import datetime
+        from collections import defaultdict
+
+        trades = self.clob.get_trades(token_id=token_id, limit=limit)
+        wallets: Dict[str, WalletActivity] = {}
+
+        for t in trades.trades:
+            notional = t.price * t.size
+            timestamp = t.datetime or datetime.utcnow()
+
+            for addr in [t.maker_address, t.owner]:
+                if not addr:
+                    continue
+
+                if addr not in wallets:
+                    wallets[addr] = WalletActivity(address=addr)
+
+                w = wallets[addr]
+                w.total_trades += 1
+                w.total_volume += notional
+
+                if w.first_seen is None or timestamp < w.first_seen:
+                    w.first_seen = timestamp
+                if w.last_seen is None or timestamp > w.last_seen:
+                    w.last_seen = timestamp
+
+                if t.side.upper() == "BUY":
+                    w.total_buy_volume += notional
+                else:
+                    w.total_sell_volume += notional
+
+                if notional >= 1000:
+                    whale_trade = WhaleTrade(
+                        trade_id=t.id,
+                        token_id=token_id,
+                        timestamp=timestamp,
+                        side=t.side,
+                        price=t.price,
+                        size=t.size,
+                        notional=notional,
+                        maker_address=t.maker_address,
+                        taker_address=t.owner,
+                    )
+                    w.recent_trades.append(whale_trade)
+                    if w.largest_trade is None or notional > w.largest_trade.notional:
+                        w.largest_trade = whale_trade
+
+        # Compute averages
+        for w in wallets.values():
+            if w.total_trades > 0:
+                w.avg_trade_size = w.total_volume / w.total_trades
+
+        return wallets
+
+    def get_top_traders(
+        self,
+        token_id: str,
+        limit: int = 20,
+    ) -> List["WalletActivity"]:
+        """
+        Get top traders by volume for a token.
+        """
+        wallets = self.get_trader_activity(token_id)
+        sorted_wallets = sorted(
+            wallets.values(),
+            key=lambda x: x.total_volume,
+            reverse=True
+        )
+        return sorted_wallets[:limit]
+
+    def get_market_whale_summary(
+        self,
+        market: "GammaMarket",
+        min_trade_size: float = 1000,
+    ) -> Dict[str, Any]:
+        """
+        Get complete whale activity summary for a market.
+        """
+        summary = {
+            "market_id": market.id,
+            "question": market.question,
+            "tokens": {},
+            "total_whale_volume": 0,
+            "unique_whales": set(),
+            "whale_trades": [],
+        }
+
+        for token in market.tokens:
+            token_id = token.get("token_id")
+            if not token_id:
+                continue
+
+            outcome = token.get("outcome", "Unknown")
+
+            # Get large orders on book
+            large_orders = self.get_large_orders(token_id, min_notional=min_trade_size)
+
+            # Get whale trades
+            whale_trades = self.get_whale_trades(token_id=token_id, min_notional=min_trade_size)
+
+            # Get trader breakdown
+            top_traders = self.get_top_traders(token_id, limit=10)
+
+            summary["tokens"][outcome] = {
+                "token_id": token_id,
+                "large_bids": [o for o in large_orders if o.side == "bid"],
+                "large_asks": [o for o in large_orders if o.side == "ask"],
+                "whale_trades": whale_trades,
+                "top_traders": top_traders,
+                "whale_buy_volume": sum(t.notional for t in whale_trades if t.side.upper() == "BUY"),
+                "whale_sell_volume": sum(t.notional for t in whale_trades if t.side.upper() == "SELL"),
+            }
+
+            summary["total_whale_volume"] += sum(t.notional for t in whale_trades)
+            for t in whale_trades:
+                if t.maker_address:
+                    summary["unique_whales"].add(t.maker_address)
+                if t.taker_address:
+                    summary["unique_whales"].add(t.taker_address)
+            summary["whale_trades"].extend(whale_trades)
+
+        summary["unique_whales"] = list(summary["unique_whales"])
+        summary["whale_trades"].sort(key=lambda x: x.timestamp, reverse=True)
+
+        return summary
+
+    # -------------------------------------------------------------------------
+    # Order Flow Tracker
+    # -------------------------------------------------------------------------
+
+    def create_order_book_tracker(self) -> "OrderBookTracker":
+        """Create an order book tracker for monitoring changes."""
+        from .orderflow import OrderBookTracker
+        return OrderBookTracker(self.clob)
+
+    def create_whale_detector(
+        self,
+        large_order_threshold: float = 1000,
+        whale_threshold: float = 5000,
+    ) -> "WhaleDetector":
+        """Create a whale detector for tracking large traders."""
+        from .orderflow import WhaleDetector
+        return WhaleDetector(self.clob, large_order_threshold, whale_threshold)
+
+    def create_signal_detector(self) -> "SignalDetector":
+        """Create a signal detector for illiquid markets."""
+        from .orderflow import SignalDetector
+        return SignalDetector()

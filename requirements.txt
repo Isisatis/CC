@@ -11,6 +11,7 @@ numpy>=1.24.0
 # Async support
 aiohttp>=3.9.0
 asyncio>=3.4.3
+websockets>=12.0  # Real-time order flow via WebSocket
 
 # Web3/Blockchain (Polymarket uses Polygon)
 web3>=6.0.0

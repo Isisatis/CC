@@ -9,6 +9,9 @@ Scans Polymarket for opportunities in illiquid markets:
 
 The thesis: In illiquid markets, large informed orders are visible
 before they move price. Get there first.
+
+IMPORTANT: Thresholds are computed dynamically from actual market data,
+not hardcoded. This ensures the scanner adapts to changing market conditions.
 """
 
 import logging
@@ -22,6 +25,13 @@ from .models import (
     OrderBookSnapshot, LargeOrder, WhaleTrade,
     IlliquidMarketSignal
 )
+
+# Import dynamic thresholds - these are computed from actual market data
+try:
+    from ..core import MarketStats, DynamicThresholds, Platform
+    HAS_CORE = True
+except ImportError:
+    HAS_CORE = False
 
 logger = logging.getLogger(__name__)
 
@@ -118,13 +128,16 @@ class MarketScanner:
     Scans for opportunities in illiquid Polymarket markets.
 
     Workflow:
-    1. Find illiquid markets (low volume, wide spreads)
-    2. Check each for unusual activity
-    3. Rank opportunities by signal strength
-    4. Return actionable list
+    1. Compute dynamic thresholds from actual market data
+    2. Find illiquid markets (bottom quartile by volume/liquidity)
+    3. Check each for unusual activity (top percentile orders)
+    4. Rank opportunities by signal strength
+    5. Return actionable list
 
     Usage:
         scanner = MarketScanner(client)
+
+        # Thresholds computed automatically from market data
         opportunities = scanner.scan()
 
         for opp in opportunities:
@@ -137,27 +150,160 @@ class MarketScanner:
     def __init__(
         self,
         client: PolymarketClient,
-        # What counts as "illiquid"
-        max_daily_volume: float = 50000,  # Markets with < $50k daily vol
-        max_liquidity: float = 100000,    # Markets with < $100k book depth
-        min_spread_bps: float = 100,       # Markets with > 1% spread
+        # Optional manual overrides (if None, computed from data)
+        max_daily_volume: Optional[float] = None,
+        max_liquidity: Optional[float] = None,
+        min_spread_bps: Optional[float] = None,
+        large_order_threshold: Optional[float] = None,
+        whale_trade_threshold: Optional[float] = None,
+        imbalance_threshold: float = 0.4,  # Book imbalance is inherently normalized
 
-        # What counts as "unusual"
-        large_order_threshold: float = 1000,   # Orders > $1k
-        whale_trade_threshold: float = 2000,   # Trades > $2k
-        imbalance_threshold: float = 0.4,      # 40% imbalance
+        # Stats computation config
+        stats_sample_size: int = 300,
     ):
         self.client = client
-
-        # Illiquidity thresholds
-        self.max_daily_volume = max_daily_volume
-        self.max_liquidity = max_liquidity
-        self.min_spread_bps = min_spread_bps
-
-        # Signal thresholds
-        self.large_order_threshold = large_order_threshold
-        self.whale_trade_threshold = whale_trade_threshold
         self.imbalance_threshold = imbalance_threshold
+        self.stats_sample_size = stats_sample_size
+
+        # Store manual overrides (None means compute from data)
+        self._manual_max_daily_volume = max_daily_volume
+        self._manual_max_liquidity = max_liquidity
+        self._manual_min_spread_bps = min_spread_bps
+        self._manual_large_order_threshold = large_order_threshold
+        self._manual_whale_trade_threshold = whale_trade_threshold
+
+        # Cached computed values
+        self._stats: Optional[Any] = None
+        self._thresholds: Optional[Any] = None
+
+    def compute_thresholds(self, force_refresh: bool = False) -> Dict[str, float]:
+        """
+        Compute thresholds from actual market data.
+
+        Uses statistical distributions to determine:
+        - Illiquid: bottom 25th percentile of volume/liquidity
+        - Large orders: top 10th percentile of trade sizes
+        - Whale orders: top 1st percentile (99th percentile)
+
+        Returns dict with all computed thresholds.
+        """
+        if self._thresholds is not None and not force_refresh:
+            return self._thresholds
+
+        logger.info(f"Computing thresholds from {self.stats_sample_size} markets...")
+
+        # Sample markets to build distributions
+        import numpy as np
+
+        markets = self.client.get_markets(MarketFilter(
+            status=MarketStatus.ACTIVE,
+            limit=self.stats_sample_size,
+            order_by="volume24hr",
+            ascending=False,  # Get most active first for representative sample
+        ))
+
+        if not markets:
+            logger.warning("No markets found, using fallback thresholds")
+            self._thresholds = self._fallback_thresholds()
+            return self._thresholds
+
+        # Collect distributions
+        volumes = []
+        liquidities = []
+        spreads = []
+        trade_sizes = []
+
+        for market in markets:
+            if market.volume_24hr:
+                volumes.append(market.volume_24hr)
+            if market.liquidity:
+                liquidities.append(market.liquidity)
+
+            # Sample order books for spread and trade data
+            for token in market.tokens[:2]:
+                token_id = token.get("token_id")
+                if not token_id:
+                    continue
+
+                try:
+                    book = self.client.clob.get_order_book(token_id)
+                    if book.spread_pct:
+                        spreads.append(book.spread_pct * 10000)  # Convert to bps
+
+                    # Get trade sizes
+                    trades = self.client.clob.get_trades(token_id=token_id, limit=30)
+                    for t in trades.trades:
+                        trade_sizes.append(t.price * t.size)
+                except Exception:
+                    pass
+
+        def percentile(data, p):
+            if not data:
+                return 0.0
+            return float(np.percentile(data, p))
+
+        # Compute thresholds from distributions
+        computed = {
+            # Illiquid = bottom quartile
+            "max_daily_volume": self._manual_max_daily_volume or percentile(volumes, 25),
+            "max_liquidity": self._manual_max_liquidity or percentile(liquidities, 25),
+            # Wide spread = top quartile (75th percentile of spreads)
+            "min_spread_bps": self._manual_min_spread_bps or percentile(spreads, 75),
+            # Large order = top 10%
+            "large_order_threshold": self._manual_large_order_threshold or percentile(trade_sizes, 90),
+            # Whale = top 1%
+            "whale_trade_threshold": self._manual_whale_trade_threshold or percentile(trade_sizes, 99),
+            # Stats for reference
+            "volume_median": percentile(volumes, 50),
+            "liquidity_median": percentile(liquidities, 50),
+            "spread_median": percentile(spreads, 50),
+            "trade_size_median": percentile(trade_sizes, 50),
+            "sample_size": len(markets),
+        }
+
+        logger.info(
+            f"Computed thresholds: illiquid_vol=${computed['max_daily_volume']:,.0f}, "
+            f"large_order=${computed['large_order_threshold']:,.0f}, "
+            f"whale=${computed['whale_trade_threshold']:,.0f}"
+        )
+
+        self._thresholds = computed
+        return computed
+
+    def _fallback_thresholds(self) -> Dict[str, float]:
+        """Fallback thresholds if we can't compute from data"""
+        return {
+            "max_daily_volume": 50000,
+            "max_liquidity": 100000,
+            "min_spread_bps": 100,
+            "large_order_threshold": 1000,
+            "whale_trade_threshold": 5000,
+            "volume_median": 100000,
+            "liquidity_median": 200000,
+            "spread_median": 50,
+            "trade_size_median": 100,
+            "sample_size": 0,
+        }
+
+    @property
+    def max_daily_volume(self) -> float:
+        return self.compute_thresholds()["max_daily_volume"]
+
+    @property
+    def max_liquidity(self) -> float:
+        return self.compute_thresholds()["max_liquidity"]
+
+    @property
+    def min_spread_bps(self) -> float:
+        return self.compute_thresholds()["min_spread_bps"]
+
+    @property
+    def large_order_threshold(self) -> float:
+        return self.compute_thresholds()["large_order_threshold"]
+
+    @property
+    def whale_trade_threshold(self) -> float:
+        return self.compute_thresholds()["whale_trade_threshold"]
 
     def find_illiquid_markets(self, limit: int = 100) -> List[GammaMarket]:
         """Find active markets that are illiquid enough to have inefficiencies"""

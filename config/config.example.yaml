@@ -1,0 +1,51 @@
+api:
+  # Polymarket CLOB API endpoints
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+
+  # Rate limiting
+  max_requests_per_second: 10
+  timeout: 30
+
+trading:
+  # Risk management
+  max_position_size: 1000  # USD
+  max_positions: 5
+  max_loss_per_trade: 100  # USD
+  max_daily_loss: 500  # USD
+
+  # Execution
+  default_slippage: 0.01  # 1%
+  order_timeout: 60  # seconds
+
+  # Market selection criteria
+  min_liquidity: 10000  # USD
+  min_volume_24h: 5000  # USD
+  max_spread: 0.05  # 5%
+
+strategies:
+  # Enable/disable specific strategies
+  arbitrage:
+    enabled: false
+    min_profit: 0.02  # 2%
+
+  market_making:
+    enabled: false
+    spread: 0.02  # 2%
+    order_size: 100  # USD
+
+  trend_following:
+    enabled: false
+    lookback_period: 24  # hours
+    momentum_threshold: 0.1
+
+backtesting:
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 10000
+  commission: 0.002  # 0.2% per trade
+
+monitoring:
+  log_level: "INFO"
+  enable_alerts: true
+  alert_email: "your-email@example.com"

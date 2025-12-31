@@ -13,6 +13,7 @@ Metric Types:
 
 import time
 import threading
+from threading import RLock
 from enum import Enum
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -65,7 +66,7 @@ class Metric:
         self.label_names = labels or []
 
         self._points: deque = deque()
-        self._lock = threading.Lock()
+        self._lock = RLock()  # Reentrant lock for nested calls
 
     def _prune_old(self):
         """Remove points older than retention period"""

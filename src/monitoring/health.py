@@ -19,7 +19,7 @@ from enum import Enum
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any, Callable
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Lock, RLock
 import statistics
 
 from .metrics import MetricsRegistry, Counter, Gauge, Histogram, Timer
@@ -100,7 +100,7 @@ class LatencyTracker:
     def __init__(self, window_size: int = 100):
         self.window_size = window_size
         self._samples: Dict[str, List[float]] = {}  # endpoint -> latencies
-        self._lock = Lock()
+        self._lock = RLock()  # Reentrant for get_all_stats -> get_stats
 
     def record(self, endpoint: str, latency_ms: float):
         """Record a latency sample"""

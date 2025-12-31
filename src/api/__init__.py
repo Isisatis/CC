@@ -72,6 +72,12 @@ from .orderflow import (
     SignalDetector,
 )
 
+from .scanner import (
+    MarketScanner,
+    MarketOpportunity,
+    format_opportunity,
+)
+
 # Conditional WebSocket import
 try:
     from .orderflow import PolymarketWebSocket
@@ -129,6 +135,11 @@ __all__ = [
 
     # Signals
     "IlliquidMarketSignal",
+
+    # Scanner
+    "MarketScanner",
+    "MarketOpportunity",
+    "format_opportunity",
 ]
 
 if HAS_WEBSOCKET:
